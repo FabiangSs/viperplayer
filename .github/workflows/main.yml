@@ -23,8 +23,8 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
         with:
-          # `tools` is a retired SDK package and makes sdkmanager fail.
-          packages: 'platform-tools, platforms;android-37, cmake;3.22.1'
+          # Package names must be separated by spaces, not commas.
+          packages: 'platform-tools platforms;android-37 cmake;3.22.1'
 
       - uses: gradle/actions/setup-gradle@v5
 
