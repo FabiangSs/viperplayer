@@ -75,11 +75,9 @@ jobs:
         run: |
           set +e
           chmod +x gradlew
-          # Memoria como argumento real + Kotlin en el mismo proceso:
-          # así los errores "e: archivo.kt" salen completos en el log.
-          G="./gradlew --stacktrace --no-daemon \
-            -Dorg.gradle.jvmargs=-Xmx4g\ -Dfile.encoding=UTF-8 \
-            -Pkotlin.compiler.execution.strategy=in-process"
+          export GRADLE_OPTS="-Dorg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8"
+          # CAMBIO 1: memoria como argumento real + Kotlin en el mismo proceso
+          G="./gradlew --stacktrace --no-daemon -Dorg.gradle.jvmargs=-Xmx4g -Pkotlin.compiler.execution.strategy=in-process"
 
           $G :app:assembleRelease 2>&1 | tee build-release.log
           R=${PIPESTATUS[0]}
@@ -93,7 +91,6 @@ jobs:
 
           if [ "$R" -ne 0 ]; then
             echo "::warning::Release falló, generando debug de respaldo"
-            grep -E '^e: ' build-release.log | head -n 20 | while read -r l; do echo "::error::$l"; done
             $G :app:assembleDebug 2>&1 | tee build-debug.log
           fi
 
@@ -133,7 +130,7 @@ jobs:
           analyze() {
             lf="$1"; label="$2"
             WW=$(awk '/\* What went wrong:/{p=1;next} /\* Try:/{p=0} p' "$lf" | sed '/^$/d' | head -n 10)
-            KT=$(grep -E '^e: ' "$lf" | head -n 10)
+            KT=$(grep -E '^e: ' "$lf" | head -n 6)
             OTH=$(grep -E 'CMake Error|ninja: error|Failed to find|Could not (resolve|find|GET)|OutOfMemoryError|No space left|Execution failed for task|icense' "$lf" | sort -u | head -n 6)
             HINT=""
             grep -qiE 'Failed to find package|platforms;android-37' "$lf" && HINT="$HINT- Paquete SDK no encontrado: mira los nombres que listó el paso 'Install SDK 37'.\n"
@@ -153,11 +150,11 @@ jobs:
               [ -n "$KT" ] && echo "$KT"
               [ -n "$OTH" ] && echo "$OTH"
               echo '```'
-              # FIX: '%b' evita que "- ..." se interprete como opción de printf
+              # CAMBIO 2: '%b' evita que "- ..." se tome como opción de printf
               [ -n "$HINT" ] && { echo "**Causa probable:**"; printf '%b' "$HINT"; }
             } >> "$OUT"
             if [ -z "$CENTRAL" ]; then
-              CENTRAL=$(printf '%s\n%s\n%s' "$KT" "$WW" "$OTH" | sed '/^$/d' | head -n 2 | tr '\n' ' ')
+              CENTRAL=$(printf '%s\n%s\n%s' "$WW" "$KT" "$OTH" | sed '/^$/d' | head -n 2 | tr '\n' ' ')
             fi
           }
 
