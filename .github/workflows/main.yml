@@ -7,8 +7,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -20,48 +19,166 @@ jobs:
           distribution: temurin
           cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          # Package names must be separated by spaces, not commas.
-          packages: 'platform-tools platforms;android-37 cmake;3.22.1'
+      - uses: android-actions/setup-android@v3
+
+      - name: Install SDK 37 (auto-detect package names)
+        shell: bash
+        run: |
+          {
+            yes | sdkmanager --licenses > /dev/null || true
+            LIST=$(sdkmanager --list 2>/dev/null)
+            echo "$LIST" | grep -E "platforms;android-3[67]|build-tools;37|ndk;|cmake;" || true
+            PLATS=$(echo "$LIST" | grep -oE "platforms;android-37(\.[0-9]+)?" | sort -u)
+            BT=$(echo "$LIST" | grep -oE "build-tools;37\.[0-9.]+" | sort -uV | tail -n1)
+            echo "Plataformas: $PLATS"
+            echo "Build-tools: $BT"
+            if [ -n "$PLATS" ]; then sdkmanager $PLATS; else sdkmanager "platforms;android-37.0"; fi
+            if [ -n "$BT" ]; then sdkmanager "$BT"; else sdkmanager "build-tools;37.0.0"; fi
+            cd "$ANDROID_HOME/platforms"
+            if [ ! -d android-37 ] && [ -d android-37.0 ]; then ln -s android-37.0 android-37; fi
+            if [ ! -d android-37.0 ] && [ -d android-37 ]; then ln -s android-37 android-37.0; fi
+            ls
+          } 2>&1 | tee "$GITHUB_WORKSPACE/sdk.log"
 
       - uses: gradle/actions/setup-gradle@v5
 
-      # Use the repository's signing key when configured. Otherwise create a temporary
-      # key so the generated release APK is installable (but cannot be used for updates
-      # signed with a different key).
-      - name: Prepare release signing key
+      - name: Keystore
+        shell: bash
         env:
           B64: ${{ secrets.SIGNING_KEY_STORE_BASE64 }}
-          ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
-          KPASS: ${{ secrets.SIGNING_KEY_PASSWORD }}
-          SPASS: ${{ secrets.SIGNING_STORE_PASSWORD }}
+          S_ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          S_KPASS: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          S_SPASS: ${{ secrets.SIGNING_STORE_PASSWORD }}
         run: |
           if [ -n "$B64" ]; then
             echo "$B64" | base64 --decode > release.jks
+            ALIAS="$S_ALIAS"; KPASS="$S_KPASS"; SPASS="$S_SPASS"
           else
-            keytool -genkeypair -v -keystore release.jks -alias viper \
+            keytool -genkeypair -keystore release.jks -alias viper \
               -keyalg RSA -keysize 2048 -validity 10000 \
-              -storepass viper123 -keypass viper123 \
-              -dname "CN=ViperPlayer"
-            ALIAS=viper
-            KPASS=viper123
-            SPASS=viper123
+              -storepass viper123 -keypass viper123 -dname "CN=ViperPlayer"
+            ALIAS=viper; KPASS=viper123; SPASS=viper123
           fi
-          echo "SIGNING_KEY_ALIAS=$ALIAS" >> "$GITHUB_ENV"
-          echo "SIGNING_KEY_PASSWORD=$KPASS" >> "$GITHUB_ENV"
-          echo "SIGNING_STORE_PASSWORD=$SPASS" >> "$GITHUB_ENV"
-          echo "SIGNING_KEY_STORE_PATH=$GITHUB_WORKSPACE/release.jks" >> "$GITHUB_ENV"
+          {
+            echo "SIGNING_KEY_ALIAS=$ALIAS"
+            echo "SIGNING_KEY_PASSWORD=$KPASS"
+            echo "SIGNING_STORE_PASSWORD=$SPASS"
+            echo "SIGNING_KEY_STORE_PATH=$GITHUB_WORKSPACE/release.jks"
+          } >> "$GITHUB_ENV"
 
-      - name: Build release APK
+      - name: Build (release, reintento y respaldo debug)
+        shell: bash
         run: |
+          set +e
           chmod +x gradlew
-          ./gradlew :app:assembleRelease --stacktrace
+          export GRADLE_OPTS="-Dorg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8"
+          G="./gradlew --stacktrace --no-daemon"
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+          $G :app:assembleRelease 2>&1 | tee build-release.log
+          R=${PIPESTATUS[0]}
+
+          if [ "$R" -ne 0 ] && grep -qiE "Could not (GET|resolve)|timed out|Connection (reset|refused)|Premature end|503|502" build-release.log; then
+            echo "::warning::Posible fallo de red, reintentando release una vez"
+            cp build-release.log build-release-intento1.log
+            $G :app:assembleRelease 2>&1 | tee build-release.log
+            R=${PIPESTATUS[0]}
+          fi
+
+          if [ "$R" -ne 0 ]; then
+            echo "::warning::Release falló, generando debug de respaldo"
+            $G :app:assembleDebug 2>&1 | tee build-debug.log
+          fi
+
+          if ! find app/build/outputs/apk -name '*.apk' 2>/dev/null | grep -q .; then
+            echo "::error::No se generó ningún APK (revisa el resumen del run)"
+            exit 1
+          fi
+
+      - name: Firmar si quedó sin firmar
+        shell: bash
+        run: |
+          shopt -s nullglob
+          AS=$(ls -d "$ANDROID_HOME"/build-tools/*/apksigner | sort -V | tail -n1)
+          for f in app/build/outputs/apk/release/*-unsigned.apk; do
+            "$AS" sign --ks release.jks \
+              --ks-pass "pass:$SIGNING_STORE_PASSWORD" \
+              --key-pass "pass:$SIGNING_KEY_PASSWORD" \
+              --ks-key-alias "$SIGNING_KEY_ALIAS" \
+              --out "${f%-unsigned.apk}-signed.apk" "$f"
+          done
+
+      - uses: actions/upload-artifact@v4
         with:
           name: viperplayer-apk
-          path: app/build/outputs/apk/release/*.apk
+          path: app/build/outputs/apk/**/*.apk
           if-no-files-found: error
+
+      - name: Diagnóstico automático
+        if: always()
+        shell: bash
+        run: |
+          OUT=diagnostico.md
+          CENTRAL=""
+          APKS=$(find app/build/outputs/apk -name '*.apk' 2>/dev/null)
+
+          analyze() {
+            lf="$1"; label="$2"
+            WW=$(awk '/\* What went wrong:/{p=1;next} /\* Try:/{p=0} p' "$lf" | sed '/^$/d' | head -n 10)
+            KT=$(grep -E '^e: ' "$lf" | head -n 6)
+            OTH=$(grep -E 'CMake Error|ninja: error|Failed to find|Could not (resolve|find|GET)|OutOfMemoryError|No space left|Execution failed for task|icense' "$lf" | sort -u | head -n 6)
+            HINT=""
+            grep -qiE 'Failed to find package|platforms;android-37' "$lf" && HINT="$HINT- Paquete SDK no encontrado: mira el paso 'Install SDK 37' y los nombres que listó.\n"
+            grep -qiE 'icense for package|licenses? not accepted' "$lf" && HINT="$HINT- Licencias del SDK sin aceptar.\n"
+            grep -qiE 'Could not (resolve|GET|find .*\.(pom|jar|aar))' "$lf" && HINT="$HINT- Dependencia o repositorio inaccesible (red o versión inexistente).\n"
+            grep -qiE 'OutOfMemoryError|Java heap space|GC overhead' "$lf" && HINT="$HINT- Falta memoria: sube -Xmx o reduce ABIs.\n"
+            grep -qiE 'CMake Error|ninja: error|NDK' "$lf" && HINT="$HINT- Problema en la compilación nativa C++ (NDK/CMake): revisa versiones en app/build.gradle.kts.\n"
+            grep -qE '^e: ' "$lf" && HINT="$HINT- Error de código Kotlin: el commit actual no compila.\n"
+            grep -qiE 'keystore|Cannot recover key|password was incorrect' "$lf" && HINT="$HINT- Problema de firma: revisa secrets o nombres SIGNING_* en el gradle.\n"
+            grep -qiE 'No space left' "$lf" && HINT="$HINT- Se acabó el disco del runner.\n"
+            grep -qiE 'Unsupported class file|invalid source release|Unsupported Java' "$lf" && HINT="$HINT- Incompatibilidad de JDK: el proyecto pide otra versión.\n"
+            {
+              echo ""
+              echo "## Error en: $label"
+              echo '```'
+              [ -n "$WW" ] && echo "$WW"
+              [ -n "$KT" ] && echo "$KT"
+              [ -n "$OTH" ] && echo "$OTH"
+              echo '```'
+              [ -n "$HINT" ] && { echo "**Causa probable:**"; printf "$HINT"; }
+            } >> "$OUT"
+            if [ -z "$CENTRAL" ]; then
+              CENTRAL=$(printf '%s\n%s\n%s' "$WW" "$KT" "$OTH" | sed '/^$/d' | head -n 2 | tr '\n' ' ')
+            fi
+          }
+
+          {
+            echo "# Resultado del build"
+            if [ -n "$APKS" ]; then
+              echo "✅ APK generado:"
+              echo "$APKS" | while read -r f; do echo "- \`$f\` ($(du -h "$f" | cut -f1))"; done
+            else
+              echo "❌ No se generó ningún APK"
+            fi
+          } > "$OUT"
+
+          [ -f build-release.log ] && grep -q "BUILD FAILED" build-release.log && analyze build-release.log "assembleRelease"
+          [ -f build-debug.log ] && grep -q "BUILD FAILED" build-debug.log && analyze build-debug.log "assembleDebug"
+          if [ ! -f build-release.log ] && [ -f sdk.log ] && [ -z "$APKS" ]; then
+            analyze sdk.log "instalación del SDK"
+          fi
+
+          [ -z "$CENTRAL" ] && [ -z "$APKS" ] && CENTRAL="Falló antes de Gradle (checkout, submódulos o keystore). Mira el primer paso en rojo."
+          if [ -n "$CENTRAL" ]; then
+            if [ -n "$APKS" ]; then LVL=warning; else LVL=error; fi
+            echo "::$LVL title=Problema central::$CENTRAL"
+          fi
+          cat "$OUT" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-y-diagnostico
+          path: |
+            diagnostico.md
+            *.log
+          if-no-files-found: ignore
