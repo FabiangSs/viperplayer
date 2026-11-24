@@ -8,7 +8,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -20,11 +20,18 @@ jobs:
           distribution: temurin
           cache: gradle
 
-      - uses: android-actions/setup-android@v3
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # `tools` is a retired SDK package and makes sdkmanager fail.
+          packages: 'platform-tools, platforms;android-37, cmake;3.22.1'
 
       - uses: gradle/actions/setup-gradle@v5
 
-      - name: Keystore
+      # Use the repository's signing key when configured. Otherwise create a temporary
+      # key so the generated release APK is installable (but cannot be used for updates
+      # signed with a different key).
+      - name: Prepare release signing key
         env:
           B64: ${{ secrets.SIGNING_KEY_STORE_BASE64 }}
           ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
@@ -38,17 +45,23 @@ jobs:
               -keyalg RSA -keysize 2048 -validity 10000 \
               -storepass viper123 -keypass viper123 \
               -dname "CN=ViperPlayer"
-            ALIAS=viper; KPASS=viper123; SPASS=viper123
+            ALIAS=viper
+            KPASS=viper123
+            SPASS=viper123
           fi
-          echo "SIGNING_KEY_ALIAS=$ALIAS" >> $GITHUB_ENV
-          echo "SIGNING_KEY_PASSWORD=$KPASS" >> $GITHUB_ENV
-          echo "SIGNING_STORE_PASSWORD=$SPASS" >> $GITHUB_ENV
-          echo "SIGNING_KEY_STORE_PATH=$GITHUB_WORKSPACE/release.jks" >> $GITHUB_ENV
+          echo "SIGNING_KEY_ALIAS=$ALIAS" >> "$GITHUB_ENV"
+          echo "SIGNING_KEY_PASSWORD=$KPASS" >> "$GITHUB_ENV"
+          echo "SIGNING_STORE_PASSWORD=$SPASS" >> "$GITHUB_ENV"
+          echo "SIGNING_KEY_STORE_PATH=$GITHUB_WORKSPACE/release.jks" >> "$GITHUB_ENV"
 
-      - run: chmod +x gradlew
-      - run: ./gradlew :app:assembleRelease --stacktrace
+      - name: Build release APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleRelease --stacktrace
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
         with:
           name: viperplayer-apk
           path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
