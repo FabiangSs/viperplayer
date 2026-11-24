@@ -19,25 +19,29 @@ jobs:
           distribution: temurin
           cache: gradle
 
-      - uses: android-actions/setup-android@v3
-
-      - name: Install SDK 37 (auto-detect package names)
+      - name: Install SDK 37 (usa el SDK del runner)
         shell: bash
         run: |
           {
-            yes | sdkmanager --licenses > /dev/null || true
-            LIST=$(sdkmanager --list 2>/dev/null)
+            export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+            echo "ANDROID_HOME=$ANDROID_HOME"
+            SM=$(command -v sdkmanager || echo "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager")
+            echo "sdkmanager: $SM"
+            yes | "$SM" --licenses > /dev/null || true
+            LIST=$("$SM" --list 2>/dev/null)
             echo "$LIST" | grep -E "platforms;android-3[67]|build-tools;37|ndk;|cmake;" || true
             PLATS=$(echo "$LIST" | grep -oE "platforms;android-37(\.[0-9]+)?" | sort -u)
             BT=$(echo "$LIST" | grep -oE "build-tools;37\.[0-9.]+" | sort -uV | tail -n1)
             echo "Plataformas: $PLATS"
             echo "Build-tools: $BT"
-            if [ -n "$PLATS" ]; then sdkmanager $PLATS; else sdkmanager "platforms;android-37.0"; fi
-            if [ -n "$BT" ]; then sdkmanager "$BT"; else sdkmanager "build-tools;37.0.0"; fi
+            if [ -n "$PLATS" ]; then "$SM" $PLATS; else "$SM" "platforms;android-37.0"; fi
+            if [ -n "$BT" ]; then "$SM" "$BT"; else "$SM" "build-tools;37.0.0"; fi
             cd "$ANDROID_HOME/platforms"
             if [ ! -d android-37 ] && [ -d android-37.0 ]; then ln -s android-37.0 android-37; fi
             if [ ! -d android-37.0 ] && [ -d android-37 ]; then ln -s android-37 android-37.0; fi
             ls
+            echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+            echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
           } 2>&1 | tee "$GITHUB_WORKSPACE/sdk.log"
 
       - uses: gradle/actions/setup-gradle@v5
@@ -117,9 +121,10 @@ jobs:
         if: always()
         shell: bash
         run: |
+          set +e
           OUT=diagnostico.md
           CENTRAL=""
-          APKS=$(find app/build/outputs/apk -name '*.apk' 2>/dev/null)
+          APKS=$(find app/build/outputs/apk -name '*.apk' 2>/dev/null || true)
 
           analyze() {
             lf="$1"; label="$2"
@@ -127,7 +132,7 @@ jobs:
             KT=$(grep -E '^e: ' "$lf" | head -n 6)
             OTH=$(grep -E 'CMake Error|ninja: error|Failed to find|Could not (resolve|find|GET)|OutOfMemoryError|No space left|Execution failed for task|icense' "$lf" | sort -u | head -n 6)
             HINT=""
-            grep -qiE 'Failed to find package|platforms;android-37' "$lf" && HINT="$HINT- Paquete SDK no encontrado: mira el paso 'Install SDK 37' y los nombres que listó.\n"
+            grep -qiE 'Failed to find package|platforms;android-37' "$lf" && HINT="$HINT- Paquete SDK no encontrado: mira los nombres que listó el paso 'Install SDK 37'.\n"
             grep -qiE 'icense for package|licenses? not accepted' "$lf" && HINT="$HINT- Licencias del SDK sin aceptar.\n"
             grep -qiE 'Could not (resolve|GET|find .*\.(pom|jar|aar))' "$lf" && HINT="$HINT- Dependencia o repositorio inaccesible (red o versión inexistente).\n"
             grep -qiE 'OutOfMemoryError|Java heap space|GC overhead' "$lf" && HINT="$HINT- Falta memoria: sube -Xmx o reduce ABIs.\n"
@@ -167,12 +172,15 @@ jobs:
             analyze sdk.log "instalación del SDK"
           fi
 
-          [ -z "$CENTRAL" ] && [ -z "$APKS" ] && CENTRAL="Falló antes de Gradle (checkout, submódulos o keystore). Mira el primer paso en rojo."
+          if [ -z "$CENTRAL" ] && [ -z "$APKS" ]; then
+            CENTRAL="Falló antes de Gradle (checkout, submódulos, SDK o keystore). Mira el primer paso en rojo."
+          fi
           if [ -n "$CENTRAL" ]; then
             if [ -n "$APKS" ]; then LVL=warning; else LVL=error; fi
             echo "::$LVL title=Problema central::$CENTRAL"
           fi
           cat "$OUT" >> "$GITHUB_STEP_SUMMARY"
+          exit 0
 
       - uses: actions/upload-artifact@v4
         if: always()
