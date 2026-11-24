@@ -1,0 +1,54 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: temurin
+          cache: gradle
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: gradle/actions/setup-gradle@v5
+
+      - name: Keystore
+        env:
+          B64: ${{ secrets.SIGNING_KEY_STORE_BASE64 }}
+          ALIAS: ${{ secrets.SIGNING_KEY_ALIAS }}
+          KPASS: ${{ secrets.SIGNING_KEY_PASSWORD }}
+          SPASS: ${{ secrets.SIGNING_STORE_PASSWORD }}
+        run: |
+          if [ -n "$B64" ]; then
+            echo "$B64" | base64 --decode > release.jks
+          else
+            keytool -genkeypair -v -keystore release.jks -alias viper \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass viper123 -keypass viper123 \
+              -dname "CN=ViperPlayer"
+            ALIAS=viper; KPASS=viper123; SPASS=viper123
+          fi
+          echo "SIGNING_KEY_ALIAS=$ALIAS" >> $GITHUB_ENV
+          echo "SIGNING_KEY_PASSWORD=$KPASS" >> $GITHUB_ENV
+          echo "SIGNING_STORE_PASSWORD=$SPASS" >> $GITHUB_ENV
+          echo "SIGNING_KEY_STORE_PATH=$GITHUB_WORKSPACE/release.jks" >> $GITHUB_ENV
+
+      - run: chmod +x gradlew
+      - run: ./gradlew :app:assembleRelease --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: viperplayer-apk
+          path: app/build/outputs/apk/release/*.apk
