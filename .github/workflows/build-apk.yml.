@@ -7,7 +7,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -15,8 +15,10 @@ jobs:
 
       - uses: actions/setup-java@v4
         with:
-          java-version: '17'
           distribution: temurin
+          java-version: |
+            17
+            21
           cache: gradle
 
       - name: Install SDK 37 (usa el SDK del runner)
@@ -24,16 +26,12 @@ jobs:
         run: |
           {
             export ANDROID_HOME="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-            echo "ANDROID_HOME=$ANDROID_HOME"
             SM=$(command -v sdkmanager || echo "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager")
-            echo "sdkmanager: $SM"
             yes | "$SM" --licenses > /dev/null || true
             LIST=$("$SM" --list 2>/dev/null)
-            echo "$LIST" | grep -E "platforms;android-3[67]|build-tools;37|ndk;|cmake;" || true
             PLATS=$(echo "$LIST" | grep -oE "platforms;android-37(\.[0-9]+)?" | sort -u)
             BT=$(echo "$LIST" | grep -oE "build-tools;37\.[0-9.]+" | sort -uV | tail -n1)
-            echo "Plataformas: $PLATS"
-            echo "Build-tools: $BT"
+            echo "Plataformas: $PLATS"; echo "Build-tools: $BT"
             if [ -n "$PLATS" ]; then "$SM" $PLATS; else "$SM" "platforms;android-37.0"; fi
             if [ -n "$BT" ]; then "$SM" "$BT"; else "$SM" "build-tools;37.0.0"; fi
             cd "$ANDROID_HOME/platforms"
@@ -45,6 +43,38 @@ jobs:
           } 2>&1 | tee "$GITHUB_WORKSPACE/sdk.log"
 
       - uses: gradle/actions/setup-gradle@v5
+
+      - name: Espejo de Maven Central (evita el error 429)
+        shell: bash
+        run: |
+          D="${GRADLE_USER_HOME:-$HOME/.gradle}/init.d"
+          mkdir -p "$D"
+          cat > "$D/maven-mirror.gradle" <<'EOF'
+          def MIRROR = java.net.URI.create("https://maven-central.storage-download.googleapis.com/maven2/")
+          def fixRepo = { repo ->
+            if (repo instanceof org.gradle.api.artifacts.repositories.MavenArtifactRepository) {
+              def u = repo.url.toString()
+              if (u.contains("repo.maven.apache.org") || u.contains("repo1.maven.org")) {
+                repo.setUrl(MIRROR)
+              }
+            }
+          }
+          beforeSettings { settings ->
+            settings.pluginManagement.repositories {
+              maven { url MIRROR }
+              gradlePluginPortal()
+              google()
+              mavenCentral()
+            }
+            settings.pluginManagement.repositories.all(fixRepo)
+            settings.dependencyResolutionManagement.repositories.all(fixRepo)
+          }
+          allprojects { p ->
+            p.repositories.all(fixRepo)
+            p.buildscript.repositories.all(fixRepo)
+          }
+          EOF
+          cat "$D/maven-mirror.gradle"
 
       - name: Keystore
         shell: bash
@@ -70,31 +100,73 @@ jobs:
             echo "SIGNING_KEY_STORE_PATH=$GITHUB_WORKSPACE/release.jks"
           } >> "$GITHUB_ENV"
 
-      - name: Build (release, reintento y respaldo debug)
+      - name: Entorno y submódulos
+        shell: bash
+        run: |
+          {
+            echo "== JDK 17 =="; "$JAVA_HOME_17_X64/bin/java" -version 2>&1
+            echo "== JDK 21 =="; "$JAVA_HOME_21_X64/bin/java" -version 2>&1
+            echo "== .gitmodules =="; cat .gitmodules
+            echo "== submódulos =="
+            S=$(git submodule status --recursive); echo "$S"
+            if grep -q '^-' <<< "$S"; then
+              echo "Submódulo sin inicializar, forzando..."
+              git submodule update --init --recursive --force
+              git submodule status --recursive
+            fi
+            echo "== gradle wrapper =="; cat gradle/wrapper/gradle-wrapper.properties
+          } 2>&1 | tee env.log
+
+      - name: Build (reintenta ante 429; JDK 17 → 21 → debug)
         shell: bash
         run: |
           set +e
           chmod +x gradlew
           export GRADLE_OPTS="-Dorg.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8"
-          G="./gradlew --stacktrace --no-daemon"
+          GF="--stacktrace --no-daemon \
+            -Dorg.gradle.java.installations.auto-detect=true \
+            -Dorg.gradle.java.installations.fromEnv=JAVA_HOME_17_X64,JAVA_HOME_21_X64 \
+            -Dorg.gradle.internal.repository.max.retries=6 \
+            -Dorg.gradle.internal.repository.initial.backoff=2000 \
+            -Dorg.gradle.internal.http.connectionTimeout=90000 \
+            -Dorg.gradle.internal.http.socketTimeout=90000"
+          J17="$JAVA_HOME_17_X64"; J21="$JAVA_HOME_21_X64"
+          NET='Too Many Requests|status code (429|5[0-9][0-9])|timed out|Connection (reset|refused)|Premature end|Could not GET'
 
-          $G :app:assembleRelease 2>&1 | tee build-release.log
-          R=${PIPESTATUS[0]}
+          gr() {
+            JAVA_HOME="$1" PATH="$1/bin:$PATH" ./gradlew $GF "$2" 2>&1 | tee "$3"
+            return "${PIPESTATUS[0]}"
+          }
 
-          if [ "$R" -ne 0 ] && grep -qiE "Could not (GET|resolve)|timed out|Connection (reset|refused)|Premature end|503|502" build-release.log; then
-            echo "::warning::Posible fallo de red, reintentando release una vez"
-            cp build-release.log build-release-intento1.log
-            $G :app:assembleRelease 2>&1 | tee build-release.log
-            R=${PIPESTATUS[0]}
+          attempt=1
+          while [ $attempt -le 3 ]; do
+            gr "$J17" :app:assembleRelease build-release.log; R=$?
+            [ $R -eq 0 ] && break
+            if grep -qiE "$NET" build-release.log; then
+              cp build-release.log "build-release-red$attempt.log"
+              echo "::warning::Fallo de red o 429 (intento $attempt/3). Esperando antes de reintentar..."
+              sleep $((attempt * 60)); attempt=$((attempt + 1))
+            else
+              break
+            fi
+          done
+
+          LAST="$J17"
+          if [ $R -ne 0 ] && ! grep -qiE "$NET" build-release.log && ! grep -qE '^e: |CMake Error|ninja: error' build-release.log; then
+            echo "::warning::Release con JDK 17 falló, probando JDK 21"
+            gr "$J21" :app:assembleRelease build-release-jdk21.log; R=$?
+            LAST="$J21"
           fi
 
-          if [ "$R" -ne 0 ]; then
+          if [ $R -ne 0 ]; then
             echo "::warning::Release falló, generando debug de respaldo"
-            $G :app:assembleDebug 2>&1 | tee build-debug.log
+            gr "$LAST" :app:assembleDebug build-debug.log
           fi
 
           if ! find app/build/outputs/apk -name '*.apk' 2>/dev/null | grep -q .; then
-            echo "::error::No se generó ningún APK (revisa el resumen del run)"
+            echo "::error::No se generó ningún APK"
+            echo "=== CAUSAS (Caused by) ==="
+            grep -h "Caused by:" build-*.log 2>/dev/null | awk '!s[$0]++' | head -n 15
             exit 1
           fi
 
@@ -128,31 +200,35 @@ jobs:
 
           analyze() {
             lf="$1"; label="$2"
-            WW=$(awk '/\* What went wrong:/{p=1;next} /\* Try:/{p=0} p' "$lf" | sed '/^$/d' | head -n 10)
+            WW=$(awk '/\* What went wrong:/{p=1;next} /\* Try:/{p=0} p' "$lf" | sed '/^$/d' | head -n 25)
+            CB=$(grep -E 'Caused by:' "$lf" | awk '!s[$0]++' | head -n 8)
+            ROOT=$(grep -E 'Caused by:' "$lf" | tail -n 1)
             KT=$(grep -E '^e: ' "$lf" | head -n 6)
-            OTH=$(grep -E 'CMake Error|ninja: error|Failed to find|Could not (resolve|find|GET)|OutOfMemoryError|No space left|Execution failed for task|icense' "$lf" | sort -u | head -n 6)
+            OTH=$(grep -E 'CMake Error|ninja: error|Failed to find|Could not (resolve|find|GET)|OutOfMemoryError|No space left|Execution failed for task|toolchain' "$lf" | awk '!s[$0]++' | head -n 6)
             HINT=""
-            grep -qiE 'Failed to find package|platforms;android-37' "$lf" && HINT="$HINT- Paquete SDK no encontrado: mira los nombres que listó el paso 'Install SDK 37'.\n"
-            grep -qiE 'icense for package|licenses? not accepted' "$lf" && HINT="$HINT- Licencias del SDK sin aceptar.\n"
-            grep -qiE 'Could not (resolve|GET|find .*\.(pom|jar|aar))' "$lf" && HINT="$HINT- Dependencia o repositorio inaccesible (red o versión inexistente).\n"
-            grep -qiE 'OutOfMemoryError|Java heap space|GC overhead' "$lf" && HINT="$HINT- Falta memoria: sube -Xmx o reduce ABIs.\n"
-            grep -qiE 'CMake Error|ninja: error|NDK' "$lf" && HINT="$HINT- Problema en la compilación nativa C++ (NDK/CMake): revisa versiones en app/build.gradle.kts.\n"
-            grep -qE '^e: ' "$lf" && HINT="$HINT- Error de código Kotlin: el commit actual no compila.\n"
-            grep -qiE 'keystore|Cannot recover key|password was incorrect' "$lf" && HINT="$HINT- Problema de firma: revisa secrets o nombres SIGNING_* en el gradle.\n"
-            grep -qiE 'No space left' "$lf" && HINT="$HINT- Se acabó el disco del runner.\n"
-            grep -qiE 'Unsupported class file|invalid source release|Unsupported Java' "$lf" && HINT="$HINT- Incompatibilidad de JDK: el proyecto pide otra versión.\n"
+            grep -qiE 'Too Many Requests|status code 429' "$lf" && HINT="$HINT- Maven Central limitó la descarga (429): el workflow usa espejo y reintenta.\n"
+            grep -qiE 'Failed to find package' "$lf" && HINT="$HINT- Paquete SDK no encontrado.\n"
+            grep -qiE 'Could not (resolve|GET|find .*\.(pom|jar|aar))' "$lf" && HINT="$HINT- Dependencia o repositorio inaccesible.\n"
+            grep -qiE 'OutOfMemoryError|Java heap space' "$lf" && HINT="$HINT- Falta memoria.\n"
+            grep -qiE 'CMake Error|ninja: error' "$lf" && HINT="$HINT- Falla la compilación nativa C++ (NDK/CMake).\n"
+            grep -qE '^e: ' "$lf" && HINT="$HINT- Error de código Kotlin.\n"
+            grep -qiE 'Unsupported class file|invalid source release|Unsupported Java|toolchain' "$lf" && HINT="$HINT- Incompatibilidad de versión de JDK.\n"
+            grep -qiE 'media3-settings-logic|build-logic-settings' "$lf" && HINT="$HINT- Falla el build-logic del submódulo Media3.\n"
             {
               echo ""
               echo "## Error en: $label"
               echo '```'
               [ -n "$WW" ] && echo "$WW"
+              [ -n "$CB" ] && { echo "--- Caused by ---"; echo "$CB"; }
               [ -n "$KT" ] && echo "$KT"
               [ -n "$OTH" ] && echo "$OTH"
               echo '```'
-              [ -n "$HINT" ] && { echo "**Causa probable:**"; printf "$HINT"; }
+              [ -n "$HINT" ] && { echo "**Causa probable:**"; printf '%b' "$HINT"; }
             } >> "$OUT"
             if [ -z "$CENTRAL" ]; then
-              CENTRAL=$(printf '%s\n%s\n%s' "$WW" "$KT" "$OTH" | sed '/^$/d' | head -n 2 | tr '\n' ' ')
+              if [ -n "$ROOT" ]; then CENTRAL="$ROOT"
+              else CENTRAL=$(printf '%s\n%s\n%s' "$WW" "$KT" "$OTH" | sed '/^$/d' | head -n 2 | tr '\n' ' ')
+              fi
             fi
           }
 
@@ -164,16 +240,20 @@ jobs:
             else
               echo "❌ No se generó ningún APK"
             fi
+            if [ -f build-release-jdk21.log ] && ! grep -q "BUILD FAILED" build-release-jdk21.log; then
+              echo "ℹ️ El release falló con JDK 17 pero funcionó con JDK 21."
+            fi
           } > "$OUT"
 
-          [ -f build-release.log ] && grep -q "BUILD FAILED" build-release.log && analyze build-release.log "assembleRelease"
-          [ -f build-debug.log ] && grep -q "BUILD FAILED" build-debug.log && analyze build-debug.log "assembleDebug"
+          for lf in build-release.log build-release-jdk21.log build-debug.log; do
+            [ -f "$lf" ] && grep -q "BUILD FAILED" "$lf" && analyze "$lf" "$lf"
+          done
           if [ ! -f build-release.log ] && [ -f sdk.log ] && [ -z "$APKS" ]; then
             analyze sdk.log "instalación del SDK"
           fi
 
           if [ -z "$CENTRAL" ] && [ -z "$APKS" ]; then
-            CENTRAL="Falló antes de Gradle (checkout, submódulos, SDK o keystore). Mira el primer paso en rojo."
+            CENTRAL="Falló antes de Gradle (checkout, submódulos, SDK o keystore)."
           fi
           if [ -n "$CENTRAL" ]; then
             if [ -n "$APKS" ]; then LVL=warning; else LVL=error; fi
